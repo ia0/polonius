@@ -37,16 +37,19 @@ pub(super) fn compute<Region: Atom, Loan: Atom, Point: Atom>(
 
     let mut result = Output::new(dump_enabled);
 
-    let borrow_live_at_start = Instant::now();
+    let timer = Instant::now();
 
-    let borrow_live_at = {
+    let errors = {
         // Create a new iteration context, ...
         let mut iteration = Iteration::new();
 
         // .. some variables, ..
         let subset = iteration.variable::<(Region, Region, Point)>("subset");
         let requires = iteration.variable::<(Region, Loan, Point)>("requires");
-        let borrow_live_at = iteration.variable::<(Loan, Point)>("borrow_live_at");
+        let borrow_live_at = iteration.variable::<((Loan, Point), ())>("borrow_live_at");
+
+        // `invalidates` facts, stored ready for joins
+        let invalidates = iteration.variable::<((Loan, Point), ())>("invalidates");
 
         // different indices for `subset`.
         let subset_r1p = iteration.variable_indistinct("subset_r1p");
@@ -63,6 +66,9 @@ pub(super) fn compute<Region: Atom, Loan: Atom, Point: Atom>(
         let requires_1 = iteration.variable_indistinct("requires_1");
         let requires_2 = iteration.variable_indistinct("requires_2");
 
+        // output
+        let errors = iteration.variable("errors");
+
         let killed = all_facts.killed.into();
         let region_live_at = iteration.variable::<((Region, Point), ())>("region_live_at");
         let cfg_edge_p = iteration.variable::<(Point, Point)>("cfg_edge_p");
@@ -74,6 +80,9 @@ pub(super) fn compute<Region: Atom, Loan: Atom, Point: Atom>(
             all_facts.region_live_at.iter().map(|&(r, p)| ((r, p), ())),
         ));
         cfg_edge_p.insert(all_facts.cfg_edge.clone().into());
+        invalidates.insert(Relation::from(
+            all_facts.invalidates.iter().map(|&(p, b)| ((b, p), ())),
+        ));
 
         // .. and then start iterating rules!
         while iteration.changed() {
@@ -120,7 +129,12 @@ pub(super) fn compute<Region: Atom, Loan: Atom, Point: Atom>(
             requires.from_join(&requires_2, &region_live_at, |&(r, q), &b, &()| (r, b, q));
 
             // borrow_live_at(B, P) :- requires(R, B, P), region_live_at(R, P)
-            borrow_live_at.from_join(&requires_rp, &region_live_at, |&(_r, p), &b, &()| (b, p));
+            borrow_live_at.from_join(&requires_rp, &region_live_at, |&(_r, p), &b, &()| {
+                ((b, p), ())
+            });
+
+            // .decl errors(B, P) :- invalidates(B, P), borrow_live_at(B, P).
+            errors.from_join(&invalidates, &borrow_live_at, |&(b, p), &(), &()| (b, p));
         }
 
         if dump_enabled {
@@ -156,20 +170,20 @@ pub(super) fn compute<Region: Atom, Loan: Atom, Point: Atom>(
             }
         }
 
-        borrow_live_at.complete()
+        errors.complete()
     };
 
     if dump_enabled {
         println!(
-            "borrow_live_at is complete: {} tuples, {:?}",
-            borrow_live_at.len(),
-            borrow_live_at_start.elapsed()
+            "errors is complete: {} tuples, {:?}",
+            errors.len(),
+            timer.elapsed()
         );
     }
 
-    for (borrow, location) in &borrow_live_at.elements {
+    for (borrow, location) in &errors.elements {
         result
-            .borrow_live_at
+            .errors
             .entry(*location)
             .or_insert(Vec::new())
             .push(*borrow);
